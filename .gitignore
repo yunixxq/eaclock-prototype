@@ -1,0 +1,131 @@
+# ============================================================
+# PostgreSQL build artifacts — EACLOCK-prototype
+# ============================================================
+
+# --- Compiled object files (all subdirectories) ---
+*.o
+**/*.o
+
+# --- Static libraries ---
+*.a
+**/*.a
+
+# --- Generated catalog headers (*_d.h) ---
+src/backend/catalog/*_d.h
+src/include/catalog/*_d.h
+
+# --- Generated node/keyword/errcode headers and their symlinks ---
+src/backend/nodes/nodetags.h
+src/include/nodes/nodetags.h
+src/include/nodes/header-stamp
+src/backend/utils/errcodes.h
+src/include/utils/errcodes.h
+src/include/utils/header-stamp
+src/include/common/keywords.h
+
+# --- Generated header symlinks (catalogs, nodes) ---
+src/backend/catalog/pg_*.h
+src/backend/nodes/*.h
+
+# --- Build system files ---
+GNUmakefile
+Makefile.global
+src/Makefile.global
+src/nls-global.mk
+config.status
+config.log
+config.cache
+objfiles.txt
+GNUmakefile.in
+Makefile.global.in
+src/Makefile.global.in
+
+# --- libpq dynamic libraries and pkg-config ---
+src/interfaces/libpq/*.dylib
+src/interfaces/libpq/*.pc
+
+# --- Dependency files ---
+*.d
+
+# --- LLVM/JIT ---
+src/backend/jit/jit.o
+src/backend/jit/jit.bc
+
+# --- Compiled backend binaries ---
+src/backend/postgres
+src/backend/postgres.bki
+src/backend/postmaster
+src/backend/postmaster/bgwriter
+src/backend/postmaster/checkpointer
+src/backend/postmaster/walwriter
+src/backend/postmaster/archiver
+src/backend/postmaster/syslogger
+src/backend/postmaster/autovacuum
+src/backend/postmaster/pgarch
+src/backend/postmaster/startup
+src/backend/postmaster/bgworker
+src/backend/postmaster/pgstat
+src/backend/postmaster/pg_walreceiver
+src/backend/postmaster/pg_background
+
+# --- src/bin/*/ compiled binaries (one per subdirectory) ---
+# All PostgreSQL bin/ subdirs produce a binary of the same name
+src/bin/*/postgres
+src/bin/*/initdb
+src/bin/*/pg_ctl
+src/bin/*/psql
+src/bin/*/pg_dump
+src/bin/*/pg_dumpall
+src/bin/*/pg_basebackup
+src/bin/*/pg_receivewal
+src/bin/*/pg_recvlogical
+src/bin/*/pg_sendwal
+src/bin/*/pg_test_fsync
+src/bin/*/pg_test_timing
+src/bin/*/pg_upgrade
+src/bin/*/pg_waldump
+src/bin/*/pg_rewind
+src/bin/*/pg_config
+src/bin/*/pgevent
+src/bin/*/pg_verifybackup
+src/bin/*/pg_amcheck
+src/bin/*/pg_archivecleanup
+src/bin/*/pg_controldata
+src/bin/*/pgbench
+src/bin/*/pg_resetwal
+src/bin/*/pg_checksums
+src/bin/scripts/*
+src/bin/extra/*
+
+src/timezone/zic
+src/timezone/zic.o
+src/timezone/abbrevs.txt
+
+# --- Generated bootstrap files ---
+src/backend/bootstrap/bootlex.c
+src/backend/bootstrap/bootscanner.c
+
+# --- Dynamic libraries (.dylib) ---
+*.dylib
+**/*.dylib
+
+# --- macOS debug symbols ---
+*.dSYM
+**/*.dSYM
+
+# --- Config files (build-generated) ---
+config.log
+config.status
+
+# --- pkg-config files ---
+*.pc
+
+# --- Installation staging directories ---
+tmp_install/
+tmp/
+
+# --- Benchmark scripts and results ---
+run_eviction_benchmark.sh
+eviction_benchmark_results.txt
+pg_eviction_latency.txt
+eviction_latency_results.md

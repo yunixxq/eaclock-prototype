@@ -17,12 +17,190 @@
 
 #include "pgstat.h"
 #include "port/atomics.h"
+#include "portability/instr_time.h"
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
+#include "utils/memutils.h"
+#include <math.h>
+#include <string.h>
 
 
 #define INT_ACCESS_ONCE(var)	((int)(*((volatile int *)&(var))))
+
+// change,latency,延迟数据结构实现
+EvictionLatencyData *LatencyData_EACLOCK = NULL;
+EvictionLatencyData *LatencyData_LIRS = NULL;
+EvictionLatencyData *LatencyData_S3FIFO = NULL;
+EvictionLatencyData *LatencyData_WATT = NULL;
+EvictionLatencyData *LatencyData_ARC = NULL;
+EvictionLatencyData *LatencyData_Hyperbolic = NULL;
+EvictionLatencyData *LatencyData_LRU2 = NULL;
+EvictionLatencyData *LatencyData_CLOCK = NULL;
+
+// change,LIRS,LIRS栈S和队列Q的哨兵节点
+BufferNode *LIRS_S_head = NULL;
+BufferNode *LIRS_S_tail = NULL;
+BufferNode *LIRS_Q_head = NULL;
+BufferNode *LIRS_Q_tail = NULL;
+int LIRS_curr_LIR_sum = 0;
+int LIRS_lirs_length = 0;
+int LIRS_hirs_length = 0;
+
+// change,S3FIFO,S3FIFO的三个队列哨兵节点
+BufferNode *S3FIFO_S_head = NULL;
+BufferNode *S3FIFO_S_tail = NULL;
+BufferNode *S3FIFO_M_head = NULL;
+BufferNode *S3FIFO_M_tail = NULL;
+BufferNode *S3FIFO_G_head = NULL;
+BufferNode *S3FIFO_G_tail = NULL;
+int S3FIFO_s_length = 0;
+int S3FIFO_m_length = 0;
+int S3FIFO_g_length = 0;
+
+// change,latency,初始化延迟数据结构(使用ShmemInitStruct分配到共享内存)
+void InitEvictionLatency(bool init)
+{
+	bool found;
+
+	/* Allocate all latency data in one shared memory segment */
+	Size total_size = MAX_LATENCY_ALGOS * sizeof(EvictionLatencyData);
+	char *base = (char *)ShmemInitStruct("Eviction Latency Data",
+										 total_size, &found);
+	if (!found)
+		memset(base, 0, total_size);
+
+	/* Point each algorithm's pointer to its slot */
+	LatencyData_EACLOCK    = (EvictionLatencyData *)(base + 0 * sizeof(EvictionLatencyData));
+	LatencyData_LIRS       = (EvictionLatencyData *)(base + 1 * sizeof(EvictionLatencyData));
+	LatencyData_S3FIFO     = (EvictionLatencyData *)(base + 2 * sizeof(EvictionLatencyData));
+	LatencyData_WATT       = (EvictionLatencyData *)(base + 3 * sizeof(EvictionLatencyData));
+	LatencyData_ARC        = (EvictionLatencyData *)(base + 4 * sizeof(EvictionLatencyData));
+	LatencyData_Hyperbolic = (EvictionLatencyData *)(base + 5 * sizeof(EvictionLatencyData));
+	LatencyData_LRU2       = (EvictionLatencyData *)(base + 6 * sizeof(EvictionLatencyData));
+	LatencyData_CLOCK      = (EvictionLatencyData *)(base + 7 * sizeof(EvictionLatencyData));
+
+	if (!found)
+	{
+		SpinLockInit(&LatencyData_EACLOCK->lat_lock);
+		SpinLockInit(&LatencyData_LIRS->lat_lock);
+		SpinLockInit(&LatencyData_S3FIFO->lat_lock);
+		SpinLockInit(&LatencyData_WATT->lat_lock);
+		SpinLockInit(&LatencyData_ARC->lat_lock);
+		SpinLockInit(&LatencyData_Hyperbolic->lat_lock);
+		SpinLockInit(&LatencyData_LRU2->lat_lock);
+		SpinLockInit(&LatencyData_CLOCK->lat_lock);
+
+		pg_atomic_init_u32(&LatencyData_EACLOCK->sample_count, 0);
+		pg_atomic_init_u32(&LatencyData_LIRS->sample_count, 0);
+		pg_atomic_init_u32(&LatencyData_S3FIFO->sample_count, 0);
+		pg_atomic_init_u32(&LatencyData_WATT->sample_count, 0);
+		pg_atomic_init_u32(&LatencyData_ARC->sample_count, 0);
+		pg_atomic_init_u32(&LatencyData_Hyperbolic->sample_count, 0);
+		pg_atomic_init_u32(&LatencyData_LRU2->sample_count, 0);
+		pg_atomic_init_u32(&LatencyData_CLOCK->sample_count, 0);
+	}
+}
+
+// change,latency,记录一次驱逐延迟
+static pg_atomic_uint64 total_evictions;
+void RecordEvictionLatency(EvictionLatencyData *data, uint64 ns)
+{
+	if (data == NULL) return;
+	uint32 idx = pg_atomic_fetch_add_u32(&data->sample_count, 1);
+	if (idx < MAX_LIRS_SAMPLES)
+		data->latencies[idx] = ns;
+}
+
+uint64 GetTotalEvictions(void) { return pg_atomic_read_u64(&total_evictions); }
+
+// change,latency,计算并输出百分位数(使用简单排序,针对小样本)
+static uint64 compute_percentile(uint64 *arr, uint32 n, double pct)
+{
+	if (n == 0) return 0;
+	// Use static buffer to avoid backend malloc/free — safe since compute_percentile
+	// is called single-threaded from PrintEvictionLatency during command execution.
+	static uint64 sort_tmp[MAX_LIRS_SAMPLES];
+	uint32 copy_n = (n < MAX_LIRS_SAMPLES) ? n : MAX_LIRS_SAMPLES;
+	memcpy(sort_tmp, arr, sizeof(uint64) * copy_n);
+	for (uint32 i = 1; i < copy_n; i++)
+	{
+		uint64 key = sort_tmp[i];
+		uint32 j = i;
+		while (j > 0 && sort_tmp[j-1] > key) { sort_tmp[j] = sort_tmp[j-1]; j--; }
+		sort_tmp[j] = key;
+	}
+	return sort_tmp[(uint32)(copy_n * pct / 100.0)];
+}
+
+void PrintEvictionLatency(const char *algo_name, EvictionLatencyData *data)
+{
+	if (data == NULL) { elog(LOG, "%s: no data", algo_name); return; }
+	uint32 n = pg_atomic_read_u32(&data->sample_count);
+	uint32 buf_sz = pg_atomic_read_u32(&data->buf_size);
+	if (n == 0) { elog(LOG, "%s: 0 samples", algo_name); return; }
+
+	uint64 p50 = compute_percentile(data->latencies, n, 50);
+	uint64 p90 = compute_percentile(data->latencies, n, 90);
+	uint64 p99 = compute_percentile(data->latencies, n, 99);
+	uint64 max = data->latencies[0];
+	for (uint32 i = 1; i < n && i < MAX_LIRS_SAMPLES; i++)
+		if (data->latencies[i] > max) max = data->latencies[i];
+
+	elog(LOG, "%s: buf_size=%u samples=%u P50=%llu ns P90=%llu ns P99=%llu ns Max=%llu ns",
+		 algo_name, buf_sz, n,
+		 (unsigned long long)p50, (unsigned long long)p90,
+		 (unsigned long long)p99, (unsigned long long)max);
+}
+
+// change,latency,打印所有算法延迟
+void PrintAllEvictionLatency(void)
+{
+	elog(LOG, "=== Eviction Latency Results ===");
+	PrintEvictionLatency("EACLOCK",   LatencyData_EACLOCK);
+	PrintEvictionLatency("LIRS",      LatencyData_LIRS);
+	PrintEvictionLatency("S3FIFO",   LatencyData_S3FIFO);
+	PrintEvictionLatency("WATT",      LatencyData_WATT);
+	PrintEvictionLatency("ARC",       LatencyData_ARC);
+	PrintEvictionLatency("Hyperbolic",LatencyData_Hyperbolic);
+	PrintEvictionLatency("LRU-2",    LatencyData_LRU2);
+	PrintEvictionLatency("CLOCK",     LatencyData_CLOCK);
+
+	// Also write to a persistent file so data survives server restarts
+	FILE *f = fopen("pg_eviction_latency.txt", "w");
+	if (f)
+	{
+		fprintf(f, "=== Eviction Latency Results ===\n");
+	#define WRITE_ALGO(name, data) do { \
+			if (data) { \
+				uint32 n = pg_atomic_read_u32(&data->sample_count); \
+				uint32 bs = pg_atomic_read_u32(&data->buf_size); \
+				if (n > 0) { \
+					uint64 p50 = compute_percentile(data->latencies, n, 50); \
+					uint64 p90 = compute_percentile(data->latencies, n, 90); \
+					uint64 p99 = compute_percentile(data->latencies, n, 99); \
+					fprintf(f, "%s: buf_size=%u samples=%u P50=%llu ns P90=%llu ns P99=%llu ns\n", \
+						name, bs, n, (unsigned long long)p50, \
+						(unsigned long long)p90, (unsigned long long)p99); \
+				} else { \
+					fprintf(f, "%s: 0 samples\n", name); \
+				} \
+			} else { \
+				fprintf(f, "%s: no data\n", name); \
+			} \
+		} while(0)
+		WRITE_ALGO("EACLOCK",    LatencyData_EACLOCK);
+		WRITE_ALGO("LIRS",       LatencyData_LIRS);
+		WRITE_ALGO("S3FIFO",    LatencyData_S3FIFO);
+		WRITE_ALGO("WATT",      LatencyData_WATT);
+		WRITE_ALGO("ARC",       LatencyData_ARC);
+		WRITE_ALGO("Hyperbolic",LatencyData_Hyperbolic);
+		WRITE_ALGO("LRU-2",    LatencyData_LRU2);
+		WRITE_ALGO("CLOCK",     LatencyData_CLOCK);
+#undef WRITE_ALGO
+		fclose(f);
+	}
+}
 
 
 // change,lru
@@ -204,41 +382,128 @@ StrategyAccessBuffer(int buf_id, bool delete)
 
 	Algorithm->StrategyAccessBuffer++;
 
-	SpinLockAcquire(&StrategyControl->lru_lock);
-
 	if (buf_id < 0 || buf_id >= NBuffers)
 	{
-		SpinLockRelease(&StrategyControl->lru_lock);
 		elog(ERROR, "Invalid buffer index");
 	}
-	
-	StrategyControl->stackTop = &lruStack[NBuffers];
-	StrategyControl->stackBottom = &lruStack[NBuffers+1];
 
-	BufferNode *curr = &lruStack[buf_id]; // focus on the node with node_id = buf_id
-	
-	// not in lru, insert to top
-	if (curr->prev == NULL && curr->next == NULL)
-	{	
-		curr->prev = StrategyControl->stackTop;
-		curr->next = StrategyControl->stackTop->next;
-		StrategyControl->stackTop->next = curr;
-		curr->next->prev = curr;
+	// WATT: 纯原子计数，无需锁
+	if (Algorithm->algorithm_first == 'w')
+	{
+		BufferNode *curr_w = &lruStack[buf_id];
+		pg_atomic_fetch_add_u32(&curr_w->Value, 1);
 	}
-	// in lru, not top
-	else if (StrategyControl->stackTop->next->node_id != buf_id)
-	{	
 
-		curr->next->prev = curr->prev;
-		curr->prev->next = curr->next;
+	// LIRS: 持锁保护 S 栈和 Q 队列
+	if (Algorithm->algorithm_first == 'i')
+	{
+		SpinLockAcquire(&StrategyControl->lru_lock);
 
-		curr->prev = StrategyControl->stackTop;
-		curr->next = StrategyControl->stackTop->next;
-		StrategyControl->stackTop->next = curr;
-		curr->next->prev = curr;
+		BufferNode *curr = &lruStack[buf_id];
+		curr->isInbuf = true;
+
+		if (!curr->isLIR)
+		{
+			// HIR命中（Q中）：晋升为LIR，插入S栈顶
+			curr->isLIR = true;
+			LIRS_curr_LIR_sum++;
+
+			// 从Q中摘除
+			BufferNode *q_curr = LIRS_Q_head->next;
+			while (q_curr != LIRS_Q_tail)
+			{
+				if (q_curr->node_id == buf_id)
+				{
+					q_curr->prev->next = q_curr->next;
+					q_curr->next->prev = q_curr->prev;
+					break;
+				}
+				q_curr = q_curr->next;
+			}
+
+			// 插入S栈顶
+			curr->prev = LIRS_S_head;
+			curr->next = LIRS_S_head->next;
+			LIRS_S_head->next->prev = curr;
+			LIRS_S_head->next = curr;
+
+			if (LIRS_curr_LIR_sum > LIRS_lirs_length)
+			{
+				BufferNode *tail = LIRS_S_tail->prev;
+				if (tail != LIRS_S_head && tail->isLIR)
+				{
+					tail->isLIR = false;
+					LIRS_curr_LIR_sum--;
+
+					tail->prev->next = tail->next;
+					tail->next->prev = tail->prev;
+					tail->prev = LIRS_Q_head;
+					tail->next = LIRS_Q_head->next;
+					LIRS_Q_head->next->prev = tail;
+					LIRS_Q_head->next = tail;
+				}
+			}
+		}
+		else
+		{
+			// LIR命中：若不在栈顶则移动到S栈顶
+			if (curr->prev != LIRS_S_head)
+			{
+				curr->prev->next = curr->next;
+				curr->next->prev = curr->prev;
+				curr->prev = LIRS_S_head;
+				curr->next = LIRS_S_head->next;
+				LIRS_S_head->next->prev = curr;
+				LIRS_S_head->next = curr;
+			}
+		}
+		SpinLockRelease(&StrategyControl->lru_lock);
 	}
-	
-	SpinLockRelease(&StrategyControl->lru_lock);
+
+	// S3FIFO: 持锁保护 S/M/G 三个队列
+	if (Algorithm->algorithm_first == '3')
+	{
+		SpinLockAcquire(&StrategyControl->lru_lock);
+
+		BufferNode *curr = &lruStack[buf_id];
+		curr->accessCount++;
+
+		// 命中3次以上：从S晋升到M
+		if (curr->accessCount >= 3)
+		{
+			if (curr->prev != NULL &&
+				curr != S3FIFO_S_head && curr != S3FIFO_S_tail)
+			{
+				curr->prev->next = curr->next;
+				curr->next->prev = curr->prev;
+				curr->prev = S3FIFO_M_head;
+				curr->next = S3FIFO_M_head->next;
+				S3FIFO_M_head->next->prev = curr;
+				S3FIFO_M_head->next = curr;
+				curr->accessCount = 0;
+			}
+		}
+
+		// G幽灵命中：从G摘除，插入S栈顶
+		BufferNode *g = S3FIFO_G_head->next;
+		while (g != S3FIFO_G_tail)
+		{
+			if (g->node_id == buf_id)
+			{
+				g->prev->next = g->next;
+				g->next->prev = g->prev;
+				g->prev = S3FIFO_S_head;
+				g->next = S3FIFO_S_head->next;
+				S3FIFO_S_head->next->prev = g;
+				S3FIFO_S_head->next = g;
+				g->accessCount = 1;
+				break;
+			}
+			g = g->next;
+		}
+
+		SpinLockRelease(&StrategyControl->lru_lock);
+	}
 
 }
 
@@ -305,6 +570,7 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 	*from_ring = false;
 
 	strategy = NULL;
+
 
 	bgwprocno = INT_ACCESS_ONCE(StrategyControl->bgwprocno);
 	if (bgwprocno != -1)
@@ -409,12 +675,14 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 		/* Nothing on the freelist, so run the "EAclock" algorithm */
 		EAclockControl->starCount = true;
 		trycounter = NBuffers;
+		instr_time t0, t1;
+		INSTR_TIME_SET_CURRENT(t0);
 		for (;;)
 		{
 			buf = GetBufferDescriptor(ClockSweepTick());
 
 			BufferNode *buf_lru_node = &lruStack[buf->buf_id];
-			
+
 			if (BUF_STATE_GET_REFCOUNT((pg_atomic_read_u32(&buf->state))) == 0)
 			{
 				if (pg_atomic_read_u32(&buf_lru_node->Value) >= 1)
@@ -439,6 +707,9 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 						pg_atomic_init_u32(&EAclockControl->evictNum, 0);
 						EAclockControl->HitInBuf = 0;
 					}
+					INSTR_TIME_SET_CURRENT(t1);
+					RecordEvictionLatency(LatencyData_EACLOCK,
+						(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
 					return buf;
 				}
 			}
@@ -453,6 +724,8 @@ StrategyGetBuffer(BufferAccessStrategy strategy, uint32 *buf_state, bool *from_r
 	{
 
 		Algorithm->GetFromLRU++;
+		instr_time t0, t1;
+		INSTR_TIME_SET_CURRENT(t0);
 again:
 		SpinLockAcquire(&StrategyControl->lru_lock);
 		// Get victim buffer from the tail of list, which means the bottom of the stack.
@@ -472,9 +745,12 @@ again:
 			{
 				*buf_state = local_buf_state;
 				SpinLockRelease(&StrategyControl->lru_lock);
+				INSTR_TIME_SET_CURRENT(t1);
+				RecordEvictionLatency(LatencyData_LRU2,
+					(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
 				return buf;
 			}
-			else if (StrategyControl->stackTop->next->node_id == buf->buf_id) 
+			else if (StrategyControl->stackTop->next->node_id == buf->buf_id)
 			{
 				UnlockBufHdr(buf, local_buf_state);
 				SpinLockRelease(&StrategyControl->lru_lock);
@@ -498,6 +774,8 @@ again:
 		Algorithm->GetFromCLOCKSWEEP++;
 		/* Nothing on the freelist, so run the "clock sweep" algorithm */
 		trycounter = NBuffers;
+		instr_time t0, t1;
+		INSTR_TIME_SET_CURRENT(t0);
 		for (;;)
 		{
 			buf = GetBufferDescriptor(ClockSweepTick());
@@ -521,6 +799,9 @@ again:
 					if (strategy != NULL)
 						AddBufferToRing(strategy, buf);
 					*buf_state = local_buf_state;
+					INSTR_TIME_SET_CURRENT(t1);
+					RecordEvictionLatency(LatencyData_LRU2,
+						(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
 					return buf;
 				}
 			}
@@ -544,6 +825,8 @@ again:
 	{
 		Algorithm->GetFromCLOCK++;
 		trycounter = NBuffers;
+		instr_time t0, t1;
+		INSTR_TIME_SET_CURRENT(t0);
 		for (;;)
 		{
 			buf = GetBufferDescriptor(ClockSweepTick());
@@ -559,6 +842,9 @@ again:
 						AddBufferToRing(strategy, buf);
 					*buf_state = local_buf_state;
 					buf->flag = true;
+					INSTR_TIME_SET_CURRENT(t1);
+					RecordEvictionLatency(LatencyData_CLOCK,
+						(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
 					return buf;
 				}
 				else
@@ -571,7 +857,7 @@ again:
 				UnlockBufHdr(buf, local_buf_state);
 				elog(ERROR, "no unpinned buffers available");
 			}
-			UnlockBufHdr(buf, local_buf_state);	
+			UnlockBufHdr(buf, local_buf_state);
 		}
 	}
 // change,random
@@ -604,7 +890,9 @@ again:
 	else if(Algorithm->algorithm_first == 'h')
 	{
 		Algorithm->GetFromHyperbolic++;
+		instr_time t0, t1;
 
+		INSTR_TIME_SET_CURRENT(t0);
 		for (;;)
 		{
 			buf = GetBufferDescriptor(hyperbolic_sample());
@@ -616,11 +904,350 @@ again:
 				*buf_state = local_buf_state;
 				BufferNode *curr = &lruStack[buf->buf_id];
 				curr->startTime = time(NULL);
-
+				INSTR_TIME_SET_CURRENT(t1);
+				RecordEvictionLatency(LatencyData_Hyperbolic,
+					(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
 				return buf;
 			}
 			UnlockBufHdr(buf, local_buf_state);
-		}	
+		}
+	}
+// change,LIRS,'i' for LIRS eviction
+	else if(Algorithm->algorithm_first == 'i')
+	{
+		Algorithm->GetFromEAclock++; // reuse counter
+		instr_time t0, t1;
+
+		INSTR_TIME_SET_CURRENT(t0);
+
+		// LIRS eviction: scan S from head, if LIR found return it; else scan Q tail
+		BufferNode *victim_node = NULL;
+		BufferNode *curr_s = LIRS_S_head->next;
+
+		while (curr_s != LIRS_S_tail)
+		{
+			int buf_id = curr_s->node_id;
+			buf = GetBufferDescriptor(buf_id);
+			local_buf_state = LockBufHdr(buf);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				if (curr_s->isLIR)
+				{
+					// Found LIR in S - evict it, insert new data as HIR in Q
+					BufferNode *s_node = curr_s;
+					s_node->prev->next = s_node->next;
+					s_node->next->prev = s_node->prev;
+					s_node->isInbuf = false;
+					s_node->isLIR = false;
+					s_node->prev = NULL;
+					s_node->next = NULL;
+					LIRS_curr_LIR_sum--;
+
+					*buf_state = local_buf_state;
+					INSTR_TIME_SET_CURRENT(t1);
+					RecordEvictionLatency(LatencyData_LIRS,
+						(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+
+					// 新数据进入：插入Q作为HIR
+					BufferNode *new_node = &lruStack[buf_id];
+					new_node->isInbuf = true;
+					new_node->isLIR = false;
+					new_node->prev = LIRS_Q_head;
+					new_node->next = LIRS_Q_head->next;
+					LIRS_Q_head->next->prev = new_node;
+					LIRS_Q_head->next = new_node;
+
+					return buf;
+				}
+				UnlockBufHdr(buf, local_buf_state);
+			}
+			else
+			{
+				UnlockBufHdr(buf, local_buf_state);
+			}
+			curr_s = curr_s->next;
+		}
+
+		// No LIR found in S, evict from Q tail (HIR resident)
+		victim_node = LIRS_Q_tail->prev;
+		if (victim_node != LIRS_Q_head)
+		{
+			int victim_buf_id = victim_node->node_id;
+			victim_node->prev->next = victim_node->next;
+			victim_node->next->prev = victim_node->prev;
+			victim_node->isInbuf = false;
+			// Reset LIR flag since this buffer now holds new data
+			victim_node->isLIR = false;
+
+			buf = GetBufferDescriptor(victim_buf_id);
+			local_buf_state = LockBufHdr(buf);
+			*buf_state = local_buf_state;
+			INSTR_TIME_SET_CURRENT(t1);
+			RecordEvictionLatency(LatencyData_LIRS,
+				(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+
+			// 将新进入的buffer插入Q作为HIR（新数据，stack distance=∞）
+			BufferNode *new_node = &lruStack[victim_buf_id];
+			new_node->isInbuf = true;
+			new_node->isLIR = false;
+			new_node->prev = LIRS_Q_head;
+			new_node->next = LIRS_Q_head->next;
+			LIRS_Q_head->next->prev = new_node;
+			LIRS_Q_head->next = new_node;
+
+			// 栈剪枝：S栈底部若存在非LIR节点，将其降级到Q
+			BufferNode *tail = LIRS_S_tail->prev;
+			while (tail != LIRS_S_head && !tail->isLIR)
+			{
+				tail->isLIR = false;
+				LIRS_curr_LIR_sum--;
+				tail->prev->next = tail->next;
+				tail->next->prev = tail->prev;
+				tail->prev = LIRS_Q_head;
+				tail->next = LIRS_Q_head->next;
+				LIRS_Q_head->next->prev = tail;
+				LIRS_Q_head->next = tail;
+				tail = LIRS_S_tail->prev;
+			}
+
+			return buf;
+		}
+
+		// Fallback: scan all buffers
+		elog(WARNING, "LIRS: no victim found, scanning all buffers");
+		INSTR_TIME_SET_CURRENT(t1);
+		RecordEvictionLatency(LatencyData_LIRS,
+			(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+		buf = GetBufferDescriptor(ClockSweepTick());
+		local_buf_state = LockBufHdr(buf);
+		*buf_state = local_buf_state;
+		return buf;
+	}
+// change,S3FIFO,'3' for S3FIFO eviction
+	else if(Algorithm->algorithm_first == '3')
+	{
+		Algorithm->GetFromCLOCK++; // reuse counter
+		instr_time t0, t1;
+
+		INSTR_TIME_SET_CURRENT(t0);
+
+		// S3FIFO eviction: first try S queue, then M queue
+		BufferNode *victim_node = NULL;
+		BufferNode *curr = S3FIFO_S_tail->prev; // scan from tail (FIFO)
+
+		while (curr != S3FIFO_S_head)
+		{
+			int buf_id = curr->node_id;
+			buf = GetBufferDescriptor(buf_id);
+			local_buf_state = LockBufHdr(buf);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				// 摘除前保存前驱指针（用于降级后继续扫描）
+				BufferNode *prev_s = curr->prev;
+				curr->prev->next = curr->next;
+				curr->next->prev = curr->prev;
+
+				if (curr->accessCount > 0)
+				{
+					// accessCount>0：降级放入M头部，继续扫描S
+					curr->prev = S3FIFO_M_head;
+					curr->next = S3FIFO_M_head->next;
+					S3FIFO_M_head->next->prev = curr;
+					S3FIFO_M_head->next = curr;
+					curr->accessCount = 0;
+					UnlockBufHdr(buf, local_buf_state);
+					// 若 S 已空则退出 S 扫描；否则继续从 prev_s 扫描
+					if (prev_s == S3FIFO_S_head)
+						break;
+					curr = prev_s;
+					continue;
+				}
+				else
+				{
+					// 真正淘汰：将新数据插入S队列头部
+					*buf_state = local_buf_state;
+					BufferNode *new_node = &lruStack[buf_id];
+					new_node->accessCount = 0;
+					new_node->prev = S3FIFO_S_head;
+					new_node->next = S3FIFO_S_head->next;
+					S3FIFO_S_head->next->prev = new_node;
+					S3FIFO_S_head->next = new_node;
+
+					// victim插入G幽灵队列头部
+					curr->prev = S3FIFO_G_head;
+					curr->next = S3FIFO_G_head->next;
+					S3FIFO_G_head->next->prev = curr;
+					S3FIFO_G_head->next = curr;
+					INSTR_TIME_SET_CURRENT(t1);
+					RecordEvictionLatency(LatencyData_S3FIFO,
+						(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+					return buf;
+				}
+			}
+			else
+			{
+				UnlockBufHdr(buf, local_buf_state);
+				curr = curr->prev;
+			}
+		}
+
+		// S is empty or all pinned, scan M
+		curr = S3FIFO_M_tail->prev;
+		while (curr != S3FIFO_M_head)
+		{
+			int buf_id = curr->node_id;
+			buf = GetBufferDescriptor(buf_id);
+			local_buf_state = LockBufHdr(buf);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				*buf_state = local_buf_state;
+				curr->prev->next = curr->next;
+				curr->next->prev = curr->prev;
+
+				// 将新数据插入S队列头部
+				BufferNode *new_node = &lruStack[buf_id];
+				new_node->accessCount = 0;
+				new_node->prev = S3FIFO_S_head;
+				new_node->next = S3FIFO_S_head->next;
+				S3FIFO_S_head->next->prev = new_node;
+				S3FIFO_S_head->next = new_node;
+
+				// victim插入G幽灵队列头部
+				curr->prev = S3FIFO_G_head;
+				curr->next = S3FIFO_G_head->next;
+				S3FIFO_G_head->next->prev = curr;
+				S3FIFO_G_head->next = curr;
+				INSTR_TIME_SET_CURRENT(t1);
+				RecordEvictionLatency(LatencyData_S3FIFO,
+					(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+				return buf;
+			}
+			UnlockBufHdr(buf, local_buf_state);
+			curr = curr->prev;
+		}
+
+		// Fallback
+		elog(WARNING, "S3FIFO: no victim found");
+		INSTR_TIME_SET_CURRENT(t1);
+		RecordEvictionLatency(LatencyData_S3FIFO,
+			(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+		buf = GetBufferDescriptor(ClockSweepTick());
+		local_buf_state = LockBufHdr(buf);
+		*buf_state = local_buf_state;
+		return buf;
+	}
+// change,WATT,'w' for WATT (LFU-based eviction with sampling)
+	else if(Algorithm->algorithm_first == 'w')
+	{
+		Algorithm->GetFromEAclock++;
+		instr_time t0, t1;
+		INSTR_TIME_SET_CURRENT(t0);
+
+		int sample_count = 8;
+		BufferDesc *candidates[8];
+		int best_buf_id = -1;
+		double best_freq = -1.0;
+		time_t now = time(NULL);
+
+		for (int i = 0; i < sample_count; i++)
+		{
+			int idx = (int)(drand48() * NBuffers);
+			candidates[i] = GetBufferDescriptor(idx);
+		}
+
+		for (int i = 0; i < sample_count; i++)
+		{
+			BufferDesc *cand = candidates[i];
+			uint32 c_state = LockBufHdr(cand);
+			if (BUF_STATE_GET_REFCOUNT(c_state) != 0)
+			{
+				UnlockBufHdr(cand, c_state);
+				continue;
+			}
+			UnlockBufHdr(cand, c_state);
+
+			BufferNode *node = &lruStack[cand->buf_id];
+			double count = pg_atomic_read_u32(&node->Value);
+			double age = difftime(now, node->startTime);
+			if (age < 0.001) age = 0.001;
+			double freq = count / age;
+			if (freq > best_freq)
+			{
+				best_freq = freq;
+				best_buf_id = cand->buf_id;
+			}
+		}
+
+		if (best_buf_id >= 0)
+		{
+			buf = GetBufferDescriptor(best_buf_id);
+			local_buf_state = LockBufHdr(buf);
+			*buf_state = local_buf_state;
+			INSTR_TIME_SET_CURRENT(t1);
+			RecordEvictionLatency(LatencyData_WATT,
+				(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+			return buf;
+		}
+
+		INSTR_TIME_SET_CURRENT(t1);
+		RecordEvictionLatency(LatencyData_WATT,
+			(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+		buf = GetBufferDescriptor(ClockSweepTick());
+		local_buf_state = LockBufHdr(buf);
+		*buf_state = local_buf_state;
+		return buf;
+	}
+// change,ARC,'a' for ARC
+	else if(Algorithm->algorithm_first == 'a')
+	{
+		Algorithm->GetFromCLOCK++;
+		instr_time t0, t1;
+		INSTR_TIME_SET_CURRENT(t0);
+
+		// ARC: replace from LRU list (reuse the standard LRU list)
+		SpinLockAcquire(&StrategyControl->lru_lock);
+		BufferNode *victim = StrategyControl->stackBottom->prev;
+		int buf_id = victim->node_id;
+
+		while (buf_id >= 0 && buf_id < NBuffers)
+		{
+			buf = GetBufferDescriptor(buf_id);
+			local_buf_state = LockBufHdr(buf);
+
+			if (BUF_STATE_GET_REFCOUNT(local_buf_state) == 0)
+			{
+				*buf_state = local_buf_state;
+				SpinLockRelease(&StrategyControl->lru_lock);
+				INSTR_TIME_SET_CURRENT(t1);
+				RecordEvictionLatency(LatencyData_ARC,
+					(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+				return buf;
+			}
+			else if (StrategyControl->stackTop->next->node_id == buf->buf_id)
+			{
+				// Top of LRU is pinned, restart
+				UnlockBufHdr(buf, local_buf_state);
+				SpinLockRelease(&StrategyControl->lru_lock);
+				victim = StrategyControl->stackBottom->prev;
+				buf_id = victim->node_id;
+				continue;
+			}
+
+			UnlockBufHdr(buf, local_buf_state);
+			victim = victim->prev;
+			buf_id = victim->node_id;
+		}
+		SpinLockRelease(&StrategyControl->lru_lock);
+		INSTR_TIME_SET_CURRENT(t1);
+		RecordEvictionLatency(LatencyData_ARC,
+			(uint64)(INSTR_TIME_GET_NANOSEC(t1) - INSTR_TIME_GET_NANOSEC(t0)));
+		buf = GetBufferDescriptor(ClockSweepTick());
+		local_buf_state = LockBufHdr(buf);
+		*buf_state = local_buf_state;
+		return buf;
 	}
 
 }
@@ -729,6 +1356,9 @@ StrategyShmemSize(void)
 	/* size of the shared replacement strategy control block */
 	size = add_size(size, MAXALIGN(sizeof(BufferStrategyControl)));
 
+	/* size of eviction latency data for all algorithms */
+	size = add_size(size, MAXALIGN(MAX_LATENCY_ALGOS * sizeof(EvictionLatencyData)));
+
 	return size;
 }
 
@@ -789,6 +1419,63 @@ StrategyInitialize(bool init)
 
 		/* No pending notification */
 		StrategyControl->bgwprocno = -1;
+
+		// change,latency,初始化延迟测量数据
+		InitEvictionLatency(true);
+		pg_atomic_init_u32(&LatencyData_EACLOCK->buf_size, NBuffers);
+		pg_atomic_init_u32(&LatencyData_LIRS->buf_size, NBuffers);
+		pg_atomic_init_u32(&LatencyData_S3FIFO->buf_size, NBuffers);
+		pg_atomic_init_u32(&LatencyData_WATT->buf_size, NBuffers);
+		pg_atomic_init_u32(&LatencyData_ARC->buf_size, NBuffers);
+		pg_atomic_init_u32(&LatencyData_Hyperbolic->buf_size, NBuffers);
+		pg_atomic_init_u32(&LatencyData_LRU2->buf_size, NBuffers);
+		pg_atomic_init_u32(&LatencyData_CLOCK->buf_size, NBuffers);
+
+		// change,LIRS,初始化LIRS栈S和队列Q的哨兵节点
+		SpinLockInit(&StrategyControl->lru_lock);
+		SpinLockAcquire(&StrategyControl->lru_lock);
+
+		LIRS_S_head = &lruStack[NBuffers];
+		LIRS_S_tail = &lruStack[NBuffers + 1];
+		LIRS_Q_head = &lruStack[NBuffers + 2];
+		LIRS_Q_tail = &lruStack[NBuffers + 3];
+
+		LIRS_S_head->prev = NULL;
+		LIRS_S_head->next = LIRS_S_tail;
+		LIRS_S_tail->prev = LIRS_S_head;
+		LIRS_S_tail->next = NULL;
+
+		LIRS_Q_head->prev = NULL;
+		LIRS_Q_head->next = LIRS_Q_tail;
+		LIRS_Q_tail->prev = LIRS_Q_head;
+		LIRS_Q_tail->next = NULL;
+
+		LIRS_lirs_length = (int)(0.95 * NBuffers);
+		LIRS_hirs_length = NBuffers - LIRS_lirs_length;
+		LIRS_curr_LIR_sum = 0;
+
+		// change,S3FIFO,初始化S3FIFO三个队列的哨兵节点
+		S3FIFO_S_head = &lruStack[NBuffers + 4];
+		S3FIFO_S_tail = &lruStack[NBuffers + 5];
+		S3FIFO_M_head = &lruStack[NBuffers + 6];
+		S3FIFO_M_tail = &lruStack[NBuffers + 7];
+		S3FIFO_G_head = &lruStack[NBuffers + 8];
+		S3FIFO_G_tail = &lruStack[NBuffers + 9];
+
+		S3FIFO_S_head->prev = NULL; S3FIFO_S_head->next = S3FIFO_S_tail;
+		S3FIFO_S_tail->prev = S3FIFO_S_head; S3FIFO_S_tail->next = NULL;
+
+		S3FIFO_M_head->prev = NULL; S3FIFO_M_head->next = S3FIFO_M_tail;
+		S3FIFO_M_tail->prev = S3FIFO_M_head; S3FIFO_M_tail->next = NULL;
+
+		S3FIFO_G_head->prev = NULL; S3FIFO_G_head->next = S3FIFO_G_tail;
+		S3FIFO_G_tail->prev = S3FIFO_G_head; S3FIFO_G_tail->next = NULL;
+
+		S3FIFO_s_length = (int)(0.1 * NBuffers);
+		S3FIFO_m_length = NBuffers - S3FIFO_s_length;
+		S3FIFO_g_length = NBuffers - S3FIFO_s_length;
+
+		SpinLockRelease(&StrategyControl->lru_lock);
 	}
 	else
 		Assert(!init);

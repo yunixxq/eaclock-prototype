@@ -290,10 +290,16 @@ typedef struct BufferNode
 // change,EAclock,这里是迫不得已放在这里，不然放desc的话UpdateValue会报错
 	pg_atomic_uint32 Value;
 
+// change,LIRS,添加LIRS标志位
+	bool isLIR;
+	bool isInbuf;
+// change,S3FIFO,添加访问计数
+	uint8 accessCount;
+
 } BufferNode;
 // change,lru,数组指针
 // A stack of buffer nodes, traces the buffer node addresses.
-BufferNode* lruStack;
+extern BufferNode* lruStack;
 
 // change,EAclock,EAclockStrategyControl
 typedef struct
@@ -313,7 +319,58 @@ typedef struct
 } EAclockStrategyControl;
 
 /* Pointers to shared state */
-EAclockStrategyControl *EAclockControl;
+extern EAclockStrategyControl *EAclockControl;
+
+// change,latency,延迟测量常量
+#define MAX_LIRS_SAMPLES 200000
+#define MAX_LATENCY_ALGOS 8
+#define LATENCY_BUF_SIZES 3
+
+// change,LIRS,添加LIRS队列头指针(哨兵节点)
+extern BufferNode *LIRS_S_head;
+extern BufferNode *LIRS_S_tail;
+extern BufferNode *LIRS_Q_head;
+extern BufferNode *LIRS_Q_tail;
+extern int LIRS_curr_LIR_sum;
+extern int LIRS_lirs_length;
+extern int LIRS_hirs_length;
+
+// change,S3FIFO,添加S3FIFO队列头指针
+extern BufferNode *S3FIFO_S_head;
+extern BufferNode *S3FIFO_S_tail;
+extern BufferNode *S3FIFO_M_head;
+extern BufferNode *S3FIFO_M_tail;
+extern BufferNode *S3FIFO_G_head;
+extern BufferNode *S3FIFO_G_tail;
+extern int S3FIFO_s_length;
+extern int S3FIFO_m_length;
+extern int S3FIFO_g_length;
+
+// change,latency,延迟数据结构
+typedef struct
+{
+	slock_t     lat_lock;          // spinlock for thread-safe writes
+	pg_atomic_uint32 sample_count; // number of samples collected
+	pg_atomic_uint32 buf_size;     // current NBuffers at time of collection
+	uint64      latencies[MAX_LIRS_SAMPLES]; // nanoseconds per eviction
+} EvictionLatencyData;
+
+// change,latency,共享内存延迟数据(每个算法一个)
+extern EvictionLatencyData *LatencyData_EACLOCK;
+extern EvictionLatencyData *LatencyData_LIRS;
+extern EvictionLatencyData *LatencyData_S3FIFO;
+extern EvictionLatencyData *LatencyData_WATT;
+extern EvictionLatencyData *LatencyData_ARC;
+extern EvictionLatencyData *LatencyData_Hyperbolic;
+extern EvictionLatencyData *LatencyData_LRU2;
+extern EvictionLatencyData *LatencyData_CLOCK;
+
+// change,latency,函数声明
+extern void InitEvictionLatency(bool init);
+extern void RecordEvictionLatency(EvictionLatencyData *data, uint64 ns);
+extern void PrintEvictionLatency(const char *algo_name, EvictionLatencyData *data);
+extern void PrintAllEvictionLatency(void);
+extern uint64 GetTotalEvictions(void);
 
 #endif
 

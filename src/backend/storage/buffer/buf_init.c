@@ -24,10 +24,13 @@ ConditionVariableMinimallyPadded *BufferIOCVArray;
 WritebackContext BackendWritebackContext;
 CkptSortItem *CkptBufferIds;
 
-// change 
+// change
 ChangeAlgorithm *Algorithm= NULL;
+// change,lru
+BufferNode *lruStack = NULL;
 // change,EAclock
 extern void UpdateWeight();
+EAclockStrategyControl *EAclockControl = NULL;
 
 
 
@@ -104,19 +107,30 @@ InitBufferPool(void)
 	/* Align descriptors to a cacheline boundary. */
 	lruStack = (BufferNode *)
 		ShmemInitStruct("lruBufferNode",
-						(NBuffers+3) * sizeof(BufferNode),
+						(NBuffers+10) * sizeof(BufferNode),
 						&foundlru);
 	if (!foundlru)
 	{
 // change,lru,初始化头尾标兵节点
-		BufferNode *lru_head = &lruStack[NBuffers]; 
-		BufferNode *lru_end = &lruStack[NBuffers+1]; 
+		BufferNode *lru_head = &lruStack[NBuffers];
+		BufferNode *lru_end = &lruStack[NBuffers+1];
 		lru_head->next = lru_end;
 		lru_end->prev = lru_head;
 		lru_end->next = NULL;
 		lru_head->prev = NULL;
 		lru_head->node_id = NBuffers;
 		lru_end->node_id = NBuffers+1;
+
+		// Initialize LIRS and S3FIFO sentinel nodes
+		for (int i = NBuffers + 2; i < NBuffers + 10; i++)
+		{
+			lruStack[i].node_id = i;
+			lruStack[i].prev = NULL;
+			lruStack[i].next = NULL;
+			lruStack[i].isLIR = false;
+			lruStack[i].isInbuf = false;
+			lruStack[i].accessCount = 0;
+		}
 	}
 
 // change,EAclock,申请全局控制器

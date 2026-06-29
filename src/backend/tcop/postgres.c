@@ -4572,7 +4572,7 @@ PostgresMain(const char *dbname, const char *username)
 		firstchar = ReadCommand(&input_message);
 
 		// change
-		char *algorithm="algorithm";
+		bool custom_cmd = false;
 
 		// algorithm s
 		// algorithm clock
@@ -4580,38 +4580,106 @@ PostgresMain(const char *dbname, const char *username)
 		// algorithm random
 		// algorithm ew
 		// algorithm ed
-        for(uint16 i=0; i<20; i++)
-        {
-			if(input_message.data[i]!=algorithm[i]){
-				break;
-			}
-			if(i==8){
-				char tmp = input_message.data[10];
-				elog(LOG, "Algorithm-> = %c", tmp);
-				if(tmp =='f')
-				{
-					elog(LOG, "Algorithm->GetFromFreelist = %d", Algorithm->GetFromFreelist);
-					elog(LOG, "Algorithm->GetFromCLOCK = %d", Algorithm->GetFromCLOCK);
-					elog(LOG, "Algorithm->GetFromCLOCKSWEEP = %d", Algorithm->GetFromCLOCKSWEEP);
-					elog(LOG, "Algorithm->GetFromEAclock = %d", Algorithm->GetFromEAclock);
-					elog(LOG, "Algorithm->GetFromLRU = %d", Algorithm->GetFromLRU);
-					elog(LOG, "Algorithm->GetFromHyperbolic = %d", Algorithm->GetFromHyperbolic);
-					elog(LOG, "Algorithm->GetFromRandom = %d", Algorithm->GetFromRandom);
-					elog(LOG, "Algorithm->StrategyAccessBuffer = %d", Algorithm->StrategyAccessBuffer);
-					//elog(LOG, "Algorithm->EAclockFdwAgeTimes = %d", Algorithm->EAclockFdwAgeTimes);
-				}else if(tmp == 'p')
-				{
-					readLRU();
+		{
+			const char *alg = "algorithm";
+			uint16 ai;
+			for (ai = 0; ai < 9 && input_message.len > ai && input_message.data[ai] == alg[ai]; ai++) {}
+			if (ai == 9 && input_message.len > 10)
+			{
+				/* Skip leading whitespace to find the algorithm character */
+				int pos = 10;
+				while (pos < input_message.len &&
+					   (input_message.data[pos] == ' ' ||
+						input_message.data[pos] == '\t' ||
+						input_message.data[pos] == '\n' ||
+						input_message.data[pos] == '\r')) {
+					pos++;
+				}
+				if (pos < input_message.len) {
+					char algo_char = input_message.data[pos];
+					if (algo_char == 'f')
+					{
+						elog(LOG, "algorithm f: print algorithm counters");
+						elog(LOG, "  GetFromFreelist = %d", Algorithm->GetFromFreelist);
+						elog(LOG, "  GetFromCLOCK = %d", Algorithm->GetFromCLOCK);
+						elog(LOG, "  GetFromCLOCKSWEEP = %d", Algorithm->GetFromCLOCKSWEEP);
+						elog(LOG, "  GetFromEAclock = %d", Algorithm->GetFromEAclock);
+						elog(LOG, "  GetFromLRU = %d", Algorithm->GetFromLRU);
+						elog(LOG, "  GetFromHyperbolic = %d", Algorithm->GetFromHyperbolic);
+						elog(LOG, "  GetFromRandom = %d", Algorithm->GetFromRandom);
+						elog(LOG, "  StrategyAccessBuffer = %d", Algorithm->StrategyAccessBuffer);
+					}
+					else if (algo_char == 'p')
+					{
+						readLRU();
+					}
+					else
+					{
+						Algorithm->algorithm_first = algo_char;
+						elog(LOG, "algorithm switched: algorithm_first = '%c' (0x%02x)",
+							 (algo_char >= 32 && algo_char < 127) ? algo_char : '?',
+							 (unsigned char)algo_char);
+					}
 				}
 				else
 				{
-					Algorithm->algorithm_first = tmp;
-					//Algorithm->algorithm_second = tmp2;
-					elog(LOG, "Algorithm->algorithm_first = %c", Algorithm->algorithm_first);
+					elog(WARNING, "algorithm command has no argument: \"%s\" (len=%d)",
+						 input_message.data, input_message.len);
 				}
-				break;
+				custom_cmd = true;
 			}
-        }
+		}
+
+		// change,latency,处理 latency 命令输出驱逐延迟结果
+		{
+			const char *lc = "latency";
+			uint16 li;
+			for (li = 0; li < 8 && input_message.data[li] == lc[li]; li++) {}
+			if (li >= 7)
+			{
+				extern void PrintAllEvictionLatency(void);
+				PrintAllEvictionLatency();
+				custom_cmd = true;
+			}
+		}
+
+		// change,latency,处理 resetlatency 命令清零延迟数据
+		if (!custom_cmd)
+		{
+			const char *rc = "resetlatency";
+			uint16 ri;
+			for (ri = 0; ri < 13 && input_message.data[ri] == rc[ri]; ri++) {}
+			if (ri >= 12)
+			{
+				extern void InitEvictionLatency(bool init);
+				InitEvictionLatency(false);
+				extern int NBuffers;
+				if (LatencyData_EACLOCK) { pg_atomic_init_u32(&LatencyData_EACLOCK->sample_count, 0); pg_atomic_write_u32(&LatencyData_EACLOCK->buf_size, NBuffers); }
+				if (LatencyData_LIRS) { pg_atomic_init_u32(&LatencyData_LIRS->sample_count, 0); pg_atomic_write_u32(&LatencyData_LIRS->buf_size, NBuffers); }
+				if (LatencyData_S3FIFO) { pg_atomic_init_u32(&LatencyData_S3FIFO->sample_count, 0); pg_atomic_write_u32(&LatencyData_S3FIFO->buf_size, NBuffers); }
+				if (LatencyData_WATT) { pg_atomic_init_u32(&LatencyData_WATT->sample_count, 0); pg_atomic_write_u32(&LatencyData_WATT->buf_size, NBuffers); }
+				if (LatencyData_ARC) { pg_atomic_init_u32(&LatencyData_ARC->sample_count, 0); pg_atomic_write_u32(&LatencyData_ARC->buf_size, NBuffers); }
+				if (LatencyData_Hyperbolic) { pg_atomic_init_u32(&LatencyData_Hyperbolic->sample_count, 0); pg_atomic_write_u32(&LatencyData_Hyperbolic->buf_size, NBuffers); }
+				if (LatencyData_LRU2) { pg_atomic_init_u32(&LatencyData_LRU2->sample_count, 0); pg_atomic_write_u32(&LatencyData_LRU2->buf_size, NBuffers); }
+				if (LatencyData_CLOCK) { pg_atomic_init_u32(&LatencyData_CLOCK->sample_count, 0); pg_atomic_write_u32(&LatencyData_CLOCK->buf_size, NBuffers); }
+				elog(LOG, "Latency data reset, buf_size=%d", NBuffers);
+				custom_cmd = true;
+			}
+		}
+
+		// change,latency,处理 evictions 命令查看总驱逐次数
+		if (!custom_cmd)
+		{
+			const char *ev_cmd = "evictions";
+			uint16 ei;
+			for (ei = 0; ei < 10 && input_message.data[ei] == ev_cmd[ei]; ei++) {}
+			if (ei >= 9)
+			{
+				extern uint64 GetTotalEvictions(void);
+				elog(LOG, "Total evictions: %llu", (unsigned long long)GetTotalEvictions());
+				custom_cmd = true;
+			}
+		}
 
 		/*
 		 * (4) turn off the idle-in-transaction and idle-session timeouts if
@@ -4660,6 +4728,13 @@ PostgresMain(const char *dbname, const char *username)
 		 */
 		if (ignore_till_sync && firstchar != EOF)
 			continue;
+
+		/* skip switch for custom commands (latency, resetlatency, algorithm) */
+		if (custom_cmd)
+		{
+			send_ready_for_query = true;
+			continue;
+		}
 
 		switch (firstchar)
 		{
